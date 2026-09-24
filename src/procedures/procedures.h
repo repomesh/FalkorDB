@@ -7,6 +7,8 @@
 #pragma once
 
 #include "proc_bfs.h"
+#include "proc_cch.h"
+#include "proc_cch_query.h"
 #include "proc_msf.h"
 #include "proc_wcc.h"
 #include "proc_cdlp.h"
@@ -19,6 +21,7 @@
 #include "proc_relations.h"
 #include "proc_procedures.h"
 #include "proc_meta_stats.h"
+#include "proc_astar_paths.h"
 #include "proc_betweenness.h"
 #include "proc_list_indexes.h"
 #include "proc_vector_query.h"

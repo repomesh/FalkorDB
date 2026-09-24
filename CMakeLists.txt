@@ -179,6 +179,8 @@ endif()
 # Using -Wno-vla-extension instead of -Wno-vla-cxx-extension for compatibility with Clang < 18
 if(CMAKE_C_COMPILER_ID MATCHES "Clang" OR CMAKE_C_COMPILER_ID MATCHES "AppleClang")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-gnu-zero-variadic-macro-arguments")
+endif()
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID MATCHES "AppleClang")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-gnu-zero-variadic-macro-arguments -Wno-error=vla-extension")
 endif()
 
@@ -270,7 +272,8 @@ include_directories(
     ${root}/deps/GraphBLAS/Include
     ${root}/deps/libcurl/include/curl
     ${root}/deps/libcypher-parser/lib/src
-    $ENV{LIBCYPHER_PARSER_BINDIR}/lib/src)
+    $ENV{LIBCYPHER_PARSER_BINDIR}/lib/src
+    $ENV{METIS_INCLUDE})
 
 add_compile_definitions(
     _GNU_SOURCE
@@ -313,6 +316,8 @@ set(RAX $ENV{RAX})
 set(LIBCYPHER_PARSER $ENV{LIBCYPHER_PARSER})
 set(UTF8PROC $ENV{UTF8PROC})
 set(ONIGURUMA $ENV{ONIGURUMA})
+set(METIS $ENV{METIS})
+set(GKLIB $ENV{GKLIB})
 
 # Build library list - redisearch-static and VectorSimilarity are CMake targets
 # Note: VectorSimilarity must be explicitly linked because redisearch-static (a static library)
@@ -330,6 +335,8 @@ set(FALKORDB_LIBS
     ${LIBCYPHER_PARSER}
     ${UTF8PROC}
     ${ONIGURUMA}
+    ${METIS}
+    ${GKLIB}
     redisearch-static
     VectorSimilarity
     OpenSSL::SSL
