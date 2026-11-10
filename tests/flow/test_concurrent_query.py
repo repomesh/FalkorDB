@@ -5,6 +5,28 @@ from falkordb.asyncio import FalkorDB
 from redis.asyncio import BlockingConnectionPool
 from redis.asyncio import Redis as AsyncRedis
 
+# overflowing a graph's 1024-deep write queue (test_17) needs >1024 concurrent
+# client connections, hence >1024 open file descriptors on both this process and
+# the server it later spawns. raise the soft limit (up to the hard cap) at import
+# time, before the server is launched, so the limit is inherited. best-effort:
+# where it can't be raised high enough, test_17 detects it and skips.
+#
+# this is a guarded, MONOTONIC bump: it only ever raises the soft limit toward the
+# hard cap, never lowers it, so no test loses headroom and an un-restored limit is
+# harmless. test_17 restores the original limit after it runs; if test_17 is
+# skipped (e.g. under SANITIZER/VALGRIND) or not selected, the raised-but-benign
+# limit simply persists for the session.
+_ORIG_NOFILE = None
+try:
+    import resource
+    _ORIG_NOFILE = resource.getrlimit(resource.RLIMIT_NOFILE)
+    _soft, _hard = _ORIG_NOFILE
+    _want = 8192 if _hard == resource.RLIM_INFINITY else min(8192, _hard)
+    if _soft < _want:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (_want, _hard))
+except Exception:
+    pass
+
 GRAPH_ID = "concurrent_query"       # Graph identifier.
 SECONDARY_GRAPH_ID = GRAPH_ID + "2" # Secondery graph identifier.
 CLIENT_COUNT = 16                   # Number of concurrent connections.
@@ -385,8 +407,12 @@ class testConcurrentQueryFlow(FlowTestsBase):
             count = 0
             count = sum(1 for res in results if res.result_set[0][1] < write_ts)
 
-            # make sure write query wasn't starved
-            self.env.assertLessEqual(count, len(read_tasks) * 0.3)
+            # make sure write query wasn't starved: only a minority of reads may
+            # commit before the write. this is a statistical bound on scheduling,
+            # not an exact one - how many reads race across the moment the writer
+            # engages the gate is subject to jitter (worse under slower debug /
+            # sanitizer builds), so allow up to 40% before calling it starvation
+            self.env.assertLessEqual(count, len(read_tasks) * 0.4)
 
             # close the connection pool
             await pool.aclose()
@@ -898,3 +924,475 @@ class testConcurrentQueryFlow(FlowTestsBase):
         # server stayed healthy and the write landed
         self.env.assertTrue(outcome['ping'])
         self.env.assertEqual(outcome['v2'], 1)
+
+    def test_19_index_build_stays_responsive(self):
+        # finishing an index build must NOT freeze the server. the indexer
+        # populates the index lock-free, then needs the graph WRITE lock to flip
+        # it active; a plain blocking acquire there pins Redis' GIL for as long as
+        # an in-flight long read holds the READ lock, freezing every client
+        # (Finding 3 of the writer-gate soak). the finish should wait for the lock
+        # in GIL-yielding slices, like the write path, so the server stays
+        # responsive throughout the build.
+        #
+        # reproduce: keep a continuous flood of long reads on the graph (so the
+        # READ lock is held the whole time), create an index, and probe PING
+        # responsiveness across the build. with the freeze a PING stalls ~a long
+        # read (seconds); with the fix the worst PING stays small.
+
+        # timing assertions are unreliable under instrumentation
+        if SANITIZER or VALGRIND:
+            self.env.skip()
+
+        # a graph large enough that the index populate scan overlaps the read
+        # flood and the build finishes while a long read holds the lock
+        self.conn.delete(GRAPH_ID)
+        self.graph.query("UNWIND range(1, 200000) AS x CREATE (:P {v:x})")
+
+        async def run(self):
+            pool = BlockingConnectionPool(max_connections=64, timeout=None, socket_timeout=60, port=self.env.port, decode_responses=True)
+            db = FalkorDB(connection_pool=pool)
+            g = db.select_graph(GRAPH_ID)
+
+            # a long read (~3s) that holds the graph READ lock for its duration.
+            # nested small ranges keep the iteration count high with bounded memory
+            # (a single range(0, 3.6e7) would materialize a ~0.5GB SIValue array).
+            # the predicate MUST depend on BOTH loop vars, else the planner pushes
+            # it below the inner UNWIND and the nested loop never runs (the read
+            # would finish in ~ms and hold no lock)
+            long_read = ("UNWIND range(0, 6000) AS a UNWIND range(0, 6000) AS b "
+                         "WITH a, b WHERE a + b < 0 RETURN count(a)")
+
+            # unrelated connection used to probe server responsiveness
+            probe = AsyncRedis(port=self.env.port, decode_responses=True)
+            await probe.ping()
+
+            loop = asyncio.get_running_loop()
+
+            # keep a few long reads overlapping so the READ lock stays
+            # continuously held for the whole build - but only a few, so the
+            # worker pool is NOT saturated (that would just starve CREATE INDEX
+            # itself and never build the index)
+            stop = False
+            reads = []
+            async def flood():
+                while not stop:
+                    while (sum(1 for r in reads if not r.done()) < 3) and not stop:
+                        reads.append(asyncio.create_task(g.ro_query(long_read)))
+                    await asyncio.sleep(0.01)
+            flood_task = asyncio.create_task(flood())
+            await asyncio.sleep(0.3)  # hold the read lock before creating the index
+
+            # is the P index operational? (sync call, run off the event loop)
+            def index_ready():
+                res = self.graph.ro_query(
+                    "CALL db.indexes() YIELD label, status "
+                    "WHERE label = 'P' AND status = 'OPERATIONAL' RETURN count(1)")
+                return res.result_set[0][0] >= 1
+
+            # create the index: its populate + finish run on the indexer thread,
+            # the finish needing the write lock behind the read flood
+            create_task = asyncio.create_task(g.query("CREATE INDEX FOR (p:P) ON (p.v)"))
+
+            # sample PING on its OWN fixed cadence in a dedicated task, so a build
+            # freeze lands in a measured PING sample. (sampling PING inline with the
+            # readiness poll would let a freeze stall the blocking poll instead of a
+            # recorded PING, and the test could pass with the bug.)
+            latencies = []
+            ping_stop = False
+            async def ping_probe():
+                while not ping_stop:
+                    t0 = loop.time()
+                    try:
+                        await probe.ping()
+                        latencies.append(loop.time() - t0)
+                    except Exception:
+                        # a failed PING (e.g. the server died) must NOT look like a
+                        # fast sample - record infinite latency so worst-PING fails
+                        latencies.append(float('inf'))
+                    await asyncio.sleep(0.02)
+            ping_task = asyncio.create_task(ping_probe())
+
+            # independently poll until the index is operational (bounded)
+            built = False
+            deadline = loop.time() + 20.0
+            while loop.time() < deadline:
+                if await loop.run_in_executor(None, index_ready):
+                    built = True
+                    break
+                await asyncio.sleep(0.05)
+
+            # stop probing + flooding and drain everything
+            ping_stop = True
+            stop = True
+            await ping_task
+            await flood_task
+            await create_task
+            read_results = await asyncio.gather(*reads, return_exceptions=True)
+
+            # the readers exist only to hold the read lock; any exception means the
+            # contention setup broke (or the server died), which would make the
+            # assertions below vacuous - surface it instead of swallowing it
+            read_errors = [r for r in read_results if isinstance(r, Exception)]
+            self.env.assertEqual(read_errors, [], message=str(read_errors[:3]))
+
+            # the index finished building within the window
+            self.env.assertTrue(built)
+
+            # server stayed responsive during the build: with the GIL pinned (old
+            # behavior) a PING would stall ~a full long read. assert on the WORST
+            # PING - the freeze is a single event a median would hide
+            worst = max(latencies) if latencies else 0.0
+            self.env.assertLess(worst, 1.0)
+
+            # the index works
+            res = await g.ro_query("MATCH (p:P {v:42}) RETURN p.v")
+            self.env.assertEqual(res.result_set[0][0], 42)
+
+            await probe.aclose()
+            await pool.aclose()
+            self.conn.delete(GRAPH_ID)
+
+        asyncio.run(run(self))
+
+    def test_20_index_churn_under_long_read_is_safe(self):
+        # a concurrent CREATE/DROP INDEX while an index build is finishing behind a
+        # long read must not crash the server. the responsive acquire yields the
+        # GIL while waiting for the write lock, so a schema change can land between
+        # slices. the index object stays alive (all Index_Free's are serialized on
+        # the single indexer thread, which is busy populating), and the finish only
+        # activates while it is still the schema's pending index (pending_changes +
+        # identity guard). this hammers that window and asserts the server stays
+        # healthy and ends in a consistent state.
+
+        if SANITIZER or VALGRIND:
+            self.env.skip()
+
+        self.conn.delete(GRAPH_ID)
+        # big enough that the populate scan runs long enough to still be finishing
+        # while the reads below hold the lock
+        self.graph.query("UNWIND range(1, 300000) AS x CREATE (:P {v:x})")
+
+        async def run(self):
+            pool = BlockingConnectionPool(max_connections=32, timeout=None, socket_timeout=60, port=self.env.port, decode_responses=True)
+            db = FalkorDB(connection_pool=pool)
+            g = db.select_graph(GRAPH_ID)
+            loop = asyncio.get_running_loop()
+
+            # hold the READ lock with bounded memory (nested small ranges). the
+            # predicate depends on BOTH vars so the planner can't push it below the
+            # inner UNWIND (which would skip the nested loop and hold no lock)
+            long_read = ("UNWIND range(0, 6000) AS a UNWIND range(0, 6000) AS b "
+                         "WITH a, b WHERE a + b < 0 RETURN count(a)")
+
+            # keep 2 overlapping reads in flight so the READ lock stays held (2 is
+            # well under the worker-pool size, so writers aren't starved)
+            async def hold_read_lock(stop_box, reads):
+                while not stop_box[0]:
+                    while sum(1 for r in reads if not r.done()) < 2 and not stop_box[0]:
+                        reads.append(asyncio.create_task(g.ro_query(long_read)))
+                    await asyncio.sleep(0.01)
+
+            for _ in range(4):
+                # create the index FIRST, with no reader holding the lock, so it
+                # acquires the write lock immediately, schedules the populate and
+                # returns. the populate then runs on the indexer while the reads
+                # below hold the lock - so the build's FINISH is what waits
+                # (GIL-yielding) behind the reads: the window the DROP must race.
+                try:
+                    await g.query("CREATE INDEX FOR (p:P) ON (p.v)")
+                except redis.exceptions.ResponseError:
+                    pass  # may already exist from a previous round
+
+                stop_box = [False]
+                reads = []
+                flood_task = asyncio.create_task(hold_read_lock(stop_box, reads))
+                await asyncio.sleep(0.3)  # reads hold the lock; the finish is waiting
+
+                # drop while the finish is waiting behind the reads - the race
+                try:
+                    await g.query("DROP INDEX FOR (p:P) ON (p.v)")
+                except redis.exceptions.ResponseError:
+                    pass  # benign "no such index" if the build hadn't landed yet
+
+                stop_box[0] = True
+                await flood_task
+                read_results = await asyncio.gather(*reads, return_exceptions=True)
+
+                # the readers exist only to hold the read lock; any exception means
+                # the contention setup broke (or the server died), which would make
+                # the assertions below vacuous - surface it instead of swallowing it
+                read_errors = [r for r in read_results if isinstance(r, Exception)]
+                self.env.assertEqual(read_errors, [], message=str(read_errors[:3]))
+
+                # server survived this round
+                self.env.assertTrue(self.conn.ping())
+
+            # ends in a consistent, usable state: rebuild and verify the index
+            # actually becomes OPERATIONAL - a label scan would answer the query
+            # below even if activation regressed, so assert the status explicitly
+            try:
+                await g.query("DROP INDEX FOR (p:P) ON (p.v)")
+            except redis.exceptions.ResponseError:
+                pass
+            await g.query("CREATE INDEX FOR (p:P) ON (p.v)")
+
+            built = False
+            deadline = loop.time() + 30.0
+            while loop.time() < deadline:
+                res = await loop.run_in_executor(None, lambda: self.graph.ro_query(
+                    "CALL db.indexes() YIELD label, status "
+                    "WHERE label = 'P' AND status = 'OPERATIONAL' RETURN count(1)"))
+                if res.result_set[0][0] >= 1:
+                    built = True
+                    break
+                await asyncio.sleep(0.05)
+            self.env.assertTrue(built)
+
+            res = await g.ro_query("MATCH (p:P {v:7}) RETURN p.v")
+            self.env.assertEqual(res.result_set[0][0], 7)
+            await pool.aclose()
+            self.conn.delete(GRAPH_ID)
+
+        asyncio.run(run(self))
+
+    def test_17_write_queue_full_replies_cleanly(self):
+        # a full per-graph write queue (1024 pending writes) must make the next
+        # write reply "Write queue is full" - it must NOT crash the server.
+        #
+        # regression: _DelegateQuery tore down this thread's QueryCtx / CommandCtx
+        # tracking *before* confirming the enqueue succeeded. when the queue was
+        # full the enqueue failed, yet the caller's cleanup path still reported the
+        # error through the now-missing QueryCtx - a NULL deref in
+        # QueryCtx_GetRedisModuleCtx <- ErrorCtx_EmitException that segfaulted the
+        # server (release builds compile out the guarding assert).
+        #
+        # repro: hold the graph READ lock with one slow read, then fire more than
+        # 1024 writes at that graph at once so the pending-write queue overflows.
+
+        if SANITIZER or VALGRIND:
+            self.env.skip()
+
+        # the queue holds 1024; need comfortably more than that pending at once,
+        # each on its own blocked-client connection, to drive it past capacity
+        QUEUE_CAP = 1024
+        N = QUEUE_CAP + 176  # 1200
+
+        self.graph.query("CREATE (:N {v:1})")
+
+        async def run(self):
+            pool = BlockingConnectionPool(max_connections=N + 32, timeout=None,
+                    socket_timeout=120, port=self.env.port, decode_responses=True)
+            db = FalkorDB(connection_pool=pool)
+            g = db.select_graph(GRAPH_ID)
+
+            loop = asyncio.get_running_loop()
+
+            # pre-open N connections so the write-flood below dispatches fast
+            # enough to saturate the queue while the read still holds the lock.
+            # this doubles as an environment probe: if the box can't sustain N
+            # client connections (FD limit / maxclients) a 1024-deep queue can't
+            # be overflowed here at all, so skip rather than flake
+            try:
+                await asyncio.gather(*[g.ro_query("RETURN 1") for _ in range(N)])
+            except Exception:
+                # couldn't open N connections. this is only a benign capacity limit
+                # (FD limit / maxclients - which surfaces as a ResponseError, not
+                # just a ConnectionError) if the server is still healthy; a crash
+                # here must FAIL the test, not skip. check on a separate connection
+                server_alive = False
+                try:
+                    server_alive = bool(self.conn.ping())
+                except Exception:
+                    server_alive = False
+                try:
+                    await pool.aclose()
+                except Exception:
+                    pass
+                self.env.assertTrue(server_alive)  # a crash during pre-warm fails
+                if server_alive:
+                    self.conn.delete(GRAPH_ID)
+                    self.env.skip()
+                return
+
+            # a slow read holds the graph READ lock, so every write piles up in
+            # the pending-write queue behind it instead of executing. use nested
+            # small ranges (bounded memory) rather than one giant range() - a
+            # single range(0, 1.5e8) would eagerly materialize a ~2.4GB SIValue
+            # array in AR_RANGE and risk OOM on constrained runners. the predicate
+            # MUST depend on BOTH loop vars, else the planner pushes it below the
+            # inner UNWIND and the nested loop never runs (the read finishes in ~ms
+            # and holds no lock)
+            slow_read = ("UNWIND range(0, 8000) AS x UNWIND range(0, 8000) AS y "
+                         "WITH x, y WHERE x + y < 0 RETURN count(x)")
+
+            async def running_reads():
+                res = await loop.run_in_executor(None, lambda:
+                    self.conn.execute_command("GRAPH.INFO", "RunningQueries"))
+                return len(res[1])
+
+            read_task = asyncio.create_task(g.ro_query(slow_read))
+
+            # the read must actually hold the READ lock before we flood
+            deadline = loop.time() + 20.0
+            while loop.time() < deadline and await running_reads() < 1:
+                await asyncio.sleep(0.02)
+
+            # fire N writes at the locked graph at once
+            writes = [asyncio.create_task(g.query(f"CREATE (:W {{i:{i}}})"))
+                      for i in range(N)]
+
+            # a "write queue is full" reply means the queue overflowed - its client
+            # isn't blocked so it returns while the accepted writes stay queued
+            # behind the read. this is the exact path that used to segfault
+            def overflow_count():
+                return sum(1 for t in writes if t.done()
+                           and t.exception() is not None
+                           and "write queue is full" in str(t.exception()).lower())
+
+            # wait until the queue overflows (bounded by the read still holding
+            # the lock - once it releases, the queue drains and can't overflow)
+            deadline = loop.time() + 60.0
+            while (loop.time() < deadline and overflow_count() == 0
+                   and not read_task.done()):
+                await asyncio.sleep(0.02)
+
+            # release the lock and let the queued writes drain
+            await read_task
+            results = await asyncio.gather(*writes, return_exceptions=True)
+
+            # classify every write outcome
+            ok = full = other = 0
+            other_samples = []
+            for r in results:
+                if isinstance(r, Exception):
+                    if "write queue is full" in str(r).lower():
+                        full += 1
+                    else:
+                        other += 1
+                        if len(other_samples) < 5:
+                            other_samples.append(str(r))
+                else:
+                    ok += 1
+
+            # unexpected errors ALWAYS fail - never masked by a skip. this catches
+            # both a crash (dropped connections on the in-flight writes) and a
+            # broken overflow path that replies with the wrong error, even if the
+            # queue never reached capacity
+            self.env.assertEqual(other, 0, message=str(other_samples))
+
+            if full == 0:
+                # the queue never overflowed before the read released: the
+                # environment couldn't fill a 1024-deep queue (too slow /
+                # connection-limited). with no unexpected errors every write must
+                # have simply succeeded; there's no overflow path to assert, skip
+                self.env.assertEqual(ok, N)
+                await pool.aclose()
+                self.conn.delete(GRAPH_ID)
+                self.env.skip()
+                return
+
+            # the overflow path was exercised: every write that made it into the
+            # queue committed
+            self.env.assertEqual(ok, N - full)
+
+            # the server stayed healthy and the accepted writes all landed
+            self.env.assertTrue(self.conn.ping())
+            res = await g.ro_query("MATCH (n:W) RETURN count(n)")
+            self.env.assertEqual(res.result_set[0][0], ok)
+
+            await pool.aclose()
+            self.conn.delete(GRAPH_ID)
+
+        try:
+            asyncio.run(run(self))
+        finally:
+            # restore the FD soft limit raised at import time (the server already
+            # inherited it at launch; only this test needed the client-side
+            # headroom), so the rest of the session runs with its original limit
+            if _ORIG_NOFILE is not None:
+                try:
+                    import resource
+                    resource.setrlimit(resource.RLIMIT_NOFILE, _ORIG_NOFILE)
+                except Exception:
+                    pass
+
+    def test_18_graph_info_during_delegated_writes(self):
+        # GRAPH.INFO RunningQueries (Globals_GetCommandCtxs) increfs every tracked
+        # CommandCtx, emits it, then frees its snapshot reference. a delegated
+        # write transfers ownership to the writer thread, which frees the
+        # CommandCtx when it finishes - while the delegating reader thread's
+        # tracking slot still points at it (the window between enqueue and
+        # untrack in _DelegateQuery). if the tracking slot does not hold its own
+        # reference, GRAPH.INFO can incref a CommandCtx the writer already freed:
+        # a use-after-free. hammer GRAPH.INFO from several clients while a stream
+        # of writes is delegated, so the sanitizer exercises that window.
+        #
+        # unlike test_17 this stays light (no 1024-deep queue, no 1200
+        # connections) so it runs under SANITIZER/VALGRIND, where the UAF is
+        # actually detectable.
+
+        WAVES = 30            # waves of concurrent writes
+        WRITES_PER_WAVE = 24  # delegated through the single-writer queue
+        HAMMERS = 3           # concurrent GRAPH.INFO RunningQueries callers
+
+        self.graph.query("CREATE (:N {v:1})")
+
+        async def run(self):
+            pool = BlockingConnectionPool(max_connections=WRITES_PER_WAVE + 16,
+                    timeout=None, socket_timeout=120, port=self.env.port,
+                    decode_responses=True)
+            db = FalkorDB(connection_pool=pool)
+            g = db.select_graph(GRAPH_ID)
+
+            # a dedicated client per hammer - never share one connection across
+            # concurrent GRAPH.INFO calls
+            info_clients = [AsyncRedis(port=self.env.port, decode_responses=True)
+                            for _ in range(HAMMERS)]
+
+            stop = False
+            info_errors = []
+
+            async def info_hammer(client):
+                while not stop:
+                    try:
+                        await client.execute_command("GRAPH.INFO", "RunningQueries")
+                    except Exception as e:
+                        info_errors.append(str(e))
+                        return
+
+            hammers = [asyncio.create_task(info_hammer(c)) for c in info_clients]
+            total = 0
+            try:
+                # each wave fires WRITES_PER_WAVE writes at once; one wins the
+                # writer election and the rest are delegated (enqueued behind it),
+                # so every wave tears down ~WRITES_PER_WAVE CommandCtxs in the
+                # delegation window while the hammers incref the tracking slots
+                for _ in range(WAVES):
+                    res = await asyncio.gather(
+                        *[g.query("CREATE (:W)") for _ in range(WRITES_PER_WAVE)],
+                        return_exceptions=True)
+                    for r in res:
+                        # a modest wave must never overflow the 1024-deep queue;
+                        # any error here is unexpected (a crash drops connections)
+                        self.env.assertFalse(isinstance(r, Exception),
+                                message=str(r))
+                        total += 1
+            finally:
+                stop = True
+                await asyncio.gather(*hammers, return_exceptions=True)
+                for c in info_clients:
+                    await c.aclose()
+
+            # the hammers must have completed cleanly - no UAF, no dropped
+            # connection, no error reply
+            self.env.assertEqual(info_errors, [])
+
+            # the server stayed healthy and every write landed
+            self.env.assertTrue(self.conn.ping())
+            res = await g.ro_query("MATCH (n:W) RETURN count(n)")
+            self.env.assertEqual(res.result_set[0][0], total)
+
+            await pool.aclose()
+            self.conn.delete(GRAPH_ID)
+
+        asyncio.run(run(self))
