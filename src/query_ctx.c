@@ -121,7 +121,7 @@ void QueryCtx_AdvanceStage
 	// update stage duration
 	_QueryCtx_UpdateStageDuration(ctx);
 
-	if(ctx->stage == QueryStage_REPORTING) {
+	if(ctx->stage == QueryStage_REPORTING && ctx->stats.log) {
 		// done reporting, log query
 		GraphContext_LogQuery (ctx->gc,
 				ctx->stats.received_ts,
@@ -199,6 +199,9 @@ void QueryCtx_SetGlobalExecutionCtx
 
 	// received timestamp (epoch time)
 	ctx->stats.received_ts = cmd_ctx->received_ts;
+
+	// whether to log the query to telemetry
+	ctx->stats.log = cmd_ctx->log_query;
 }
 
 // set the provided AST for access through the QueryCtx
@@ -208,6 +211,19 @@ void QueryCtx_SetAST
 ) {
 	QueryCtx *ctx = _QueryCtx_GetCreateCtx();
 	ctx->query_data.ast = ast;
+}
+
+// sets the Redis context of a command that doesn't go through
+// QueryCtx_SetGlobalExecutionCtx (e.g. GRAPH.CONSTRAINT)
+void QueryCtx_SetRedisCtx
+(
+	RedisModuleCtx *redis_ctx
+) {
+	ASSERT (redis_ctx != NULL) ;
+	QueryCtx *ctx = _QueryCtx_GetCreateCtx () ;
+	ctx->global_exec_ctx.redis_ctx = redis_ctx ;
+	// blocked client on a worker thread, NULL on the Redis main thread
+	ctx->global_exec_ctx.bc = RedisModule_GetBlockedClientHandle (redis_ctx) ;
 }
 
 // set the provided GraphCtx for access through the QueryCtx
